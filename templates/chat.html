@@ -127,16 +127,28 @@
       .then(data => {
         const matched = data.matched_question || "";
         const answer = data.matched_answer || data.response || "❌ Cevap bulunamadı.";
-        const score = data.similarity ? `Eşleşen Soru: ${matched} (${data.similarity}%)` : "";
+        const score = data.similarity ? `${data.similarity}%` : "";
+        const source = data.source === "gemini" 
+                        ? "<em>(Gemini tarafından yanıtlandı)</em>"
+                        : "<em>(Veri setinden yanıtlandı)</em>";
 
         const botMessage = document.createElement("div");
         botMessage.className = "message bot-message";
-        botMessage.innerHTML = `
-          <div><strong>${score}</strong></div>
-          <div style="margin-top: 5px;">${answer}</div>
-        `;
-        chatContainer.appendChild(botMessage);
 
+        if (data.source === "faq") {
+          botMessage.innerHTML = `
+            <div><strong>Eşleşen Soru:</strong> ${matched} (${score})</div>
+            <div style="margin-top: 5px;">${answer}</div>
+            <div class="match-score">${source}</div>
+          `;
+        } else {
+          botMessage.innerHTML = `
+            <div>${answer}</div>
+            <div class="match-score">${source}</div>
+          `;
+        }
+
+        chatContainer.appendChild(botMessage);
         chatContainer.scrollTop = chatContainer.scrollHeight;
       });
     }
