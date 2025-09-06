@@ -1,72 +1,154 @@
 from flask import Flask, request, jsonify, render_template
+import os
+import unicodedata
+import re
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import os
 from dotenv import load_dotenv
 import google.generativeai as genai
 
-app = Flask(__name__)
-
-# --- Gemini ayarları ---
+# =======================
+# Config
+# =======================
 load_dotenv()
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
-# --- CSV yükleme ---
-df = pd.read_csv("questions.csv")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY not found in environment (.env).")
 
-# TF-IDF vektörleştirici ile soru gövdelerini hazırla
-vectorizer = TfidfVectorizer()
-tfidf_matrix = vectorizer.fit_transform(df["question"])
+CSV_PATH = os.getenv("CSV_PATH", "questions.csv")
+SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.70"))  # Flask örneğinde 70 idi
+
+# Zorunlu anahtar kelime(ler): sadece "karaciğer" istiyorsan bu seti tek elemanla bırak
+REQUIRED_TOKENS = {"karaciger"}  # istersen {"karaciger", "liver", "hepatit", "siroz"} yap
+
+# =======================
+# Helpers
+# =======================
+def normalize_text(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    s = s.lower().strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def tr_simplify(s: str) -> str:
+    """Türkçe diakritikleri sadeleştir (karaciğer -> karaciger), lower-case."""
+    if not isinstance(s, str):
+        return ""
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    return s.lower()
+
+def contains_required_keyword(user_q: str) -> bool:
+    t = tr_simplify(user_q)
+    return any(tok in t for tok in REQUIRED_TOKENS)
+
+# =======================
+# Gemini
+# =======================
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+
+def ask_gemini(user_input: str) -> str:
+    prompt = (
+        "Sen dikkatli bir tıbbi asistansın. "
+        "Sorulara TÜRKÇE yanıt ver. "
+        "Kısa ve anlaşılır cevaplar yaz. "
+        "Eğer soru karaciğer sağlığı ile ilgili değilse, "
+        "'Bu soru karaciğer sağlığı ile ilgili değil.' diye cevap ver. "
+        "Gerekli olduğunda standart tıbbi uyarıları ekle.\n\n"
+        f"Kullanıcı sorusu:\n{user_input}\n"
+    )
+    resp = gemini_model.generate_content(prompt)
+    return (getattr(resp, "text", "") or "").strip() or "Cevap alınamadı."
+
+# =======================
+# Data + Vectorizer
+# =======================
+if not os.path.exists(CSV_PATH):
+    raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
+
+df = pd.read_csv(CSV_PATH)
+
+for col in ("question", "answer"):
+    if col not in df.columns:
+        raise ValueError(f"CSV must contain '{col}' column.")
+
+df["question_norm"] = df["question"].fillna("").map(normalize_text)
+vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=1)
+tfidf_matrix = vectorizer.fit_transform(df["question_norm"])
+
+# =======================
+# Flask
+# =======================
+app = Flask(__name__)
 
 @app.route("/")
 def home():
+    # templates/chat.html varsa render_template ile; yoksa send_from_directory kullan
     return render_template("chat.html")
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    user_input = request.json["message"]
-    user_tfidf = vectorizer.transform([user_input])
-    similarity = cosine_similarity(user_tfidf, tfidf_matrix)
+    payload = request.get_json(force=True)
+    user_input = (payload or {}).get("message", "")
+    user_norm = normalize_text(user_input)
 
-    # En benzer soruyu bul
-    max_index = similarity.argmax()
-    matched_question = df.iloc[max_index]["question"]
-    matched_answer = df.iloc[max_index]["answer"]
-    match_score = round(similarity[0][max_index] * 100, 1)
+    # 0) Zorunlu anahtar kelime filtresi: "karaciğer" geçmiyorsa cevaplama
+    if not contains_required_keyword(user_input):
+        return jsonify({
+            "matched_question": None,
+            "matched_answer": "",
+            "similarity": 0.0,
+            "source": "blocked"
+        })
 
-    # Eğer benzerlik %70’in altındaysa veya eşleşen soru içinde "karaciğer" yoksa → Gemini
-    if match_score < 70 or "karaciğer" not in matched_question.lower():
+    # 1) Exact match kontrolü
+    exact_mask = (df["question_norm"] == user_norm)
+    if exact_mask.any():
+        idx = int(exact_mask[exact_mask].index[0])
+        return jsonify({
+            "matched_question": df.iloc[idx]["question"],
+            "matched_answer": df.iloc[idx]["answer"],
+            "similarity": 100.0,
+            "source": "faq"
+        })
+
+    # 2) TF-IDF benzerlik (question-only)
+    user_vec = vectorizer.transform([user_norm])
+    sims = cosine_similarity(user_vec, tfidf_matrix).flatten()
+    best_idx = int(sims.argmax())
+    match_score = float(sims[best_idx] * 100.0)
+    matched_q = df.iloc[best_idx]["question"]
+    matched_a = df.iloc[best_idx]["answer"]
+
+    # 3) Eşik kontrolü: altındaysa Gemini
+    if match_score < SIM_THRESHOLD * 100:
         try:
-            response = gemini_model.generate_content(
-                f"Kullanıcı şunu sordu: {user_input}\n\n"
-                f"Sen bir karaciğer sağlığı asistanısın. "
-                f"Eğer soru alakasızsa 'Bu soru karaciğer sağlığı ile ilgili değil' diye cevap ver. "
-                f"Kısa ve anlaşılır yanıt ver."
-            )
-            gemini_answer = response.text.strip() if response.text else "Cevap alınamadı."
+            g_answer = ask_gemini(user_input)
             return jsonify({
                 "matched_question": None,
-                "matched_answer": gemini_answer,
-                "similarity": match_score,
+                "matched_answer": g_answer,
+                "similarity": round(match_score, 1),
                 "source": "gemini"
             })
         except Exception as e:
             return jsonify({
                 "matched_question": None,
-                "matched_answer": f"Gemini API hatası: {str(e)}",
-                "similarity": match_score,
+                "matched_answer": f"Gemini API error: {e}",
+                "similarity": round(match_score, 1),
                 "source": "gemini"
             })
 
-    # Eğer %70 üzerindeyse CSV cevabı dön
+    # 4) Eşik üstünde → CSV cevabı
     return jsonify({
-        "matched_question": matched_question,
-        "matched_answer": matched_answer,
-        "similarity": match_score,
+        "matched_question": matched_q,
+        "matched_answer": matched_a,
+        "similarity": round(match_score, 1),
         "source": "faq"
     })
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5001)  # 5000 dolu olabilir, garanti olsun diye 5001
+    # 5000 doluysa değiştir
+    app.run(debug=True, port=5001)
